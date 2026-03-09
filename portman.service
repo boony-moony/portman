@@ -1,0 +1,19 @@
+[Unit]
+Description=portman - iptables DNAT manager
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/portman
+Environment=PORTMAN_USER=admin
+Environment=PORTMAN_PASS=changeme
+Environment=DEST_IP=10.0.0.2
+Environment=WAN_IFACE=eth0
+Environment=SECRET_KEY=change-this-random-string
+ExecStart=/usr/bin/python3 /opt/portman/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
