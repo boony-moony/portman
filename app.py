@@ -185,10 +185,11 @@ def cf_create_srv_record(subdomain, target, port, proto="tcp"):
             return {"ok": True, "msg": "SRV record already exists"}
     result = cf_api("POST", "/dns_records", {
         "type": "SRV",
+        "name": srv_name,
         "data": {
-            "name":     srv_name,
             "service":  "_minecraft",
             "proto":    f"_{proto}",
+            "name":     subdomain,
             "priority": 0,
             "weight":   5,
             "port":     int(port),
@@ -635,6 +636,63 @@ def cf_delete_dns(index):
         save_cf_auth(d)
     return jsonify({"ok": True})
 
+
+@app.route("/api/cf/zone_records", methods=["GET"])
+@auth.login_required
+def cf_zone_records():
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    try:
+        result = cf_api("GET", "/dns_records?per_page=100")
+        if not result.get("success"):
+            raise RuntimeError(str(result.get("errors")))
+        records = result.get("result", [])
+        # Load portman-created labels for cross-referencing
+        d = load_cf_auth()
+        entries = d.get("dns_entries", [])
+        portman_domains = {e["full_domain"]: e["label"] for e in entries}
+        portman_subdomains = {e["subdomain"]: e["label"] for e in entries}
+
+        out = []
+        for r in records:
+            rtype = r.get("type", "")
+            name  = r.get("name", "")
+            # Classify
+            if rtype == "SRV" and "_minecraft" in name:
+                category = "minecraft"
+            elif rtype == "SRV":
+                category = "srv"
+            elif rtype == "A":
+                category = "a"
+            else:
+                category = "other"
+
+            # Try to match a portman label
+            label = portman_domains.get(name, "")
+            if not label:
+                for sub, lbl in portman_subdomains.items():
+                    if name.endswith("." + sub + ".") or ("." + sub + ".") in name or name.endswith(sub):
+                        label = lbl
+                        break
+
+            content = r.get("content", "")
+            if rtype == "SRV":
+                data = r.get("data", {})
+                content = f'{data.get("target","")}:{data.get("port","")}'
+
+            out.append({
+                "id":       r.get("id"),
+                "type":     rtype,
+                "name":     name,
+                "content":  content,
+                "category": category,
+                "label":    label,
+                "proxied":  r.get("proxied", False),
+            })
+        return jsonify({"ok": True, "records": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 # ── Cloudflare pages (embedded HTML) ─────────────────────────────────────────
 
 CF_SETUP_PAGE = """<!DOCTYPE html>
@@ -846,6 +904,37 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
   <button class="btn" onclick="saveConfig()">SAVE CONFIG</button>
 </div>
 
+<!-- Live zone records -->
+<div class="section">
+  <h2 style="display:flex;align-items:center;justify-content:space-between">
+    <span>zone dns records</span>
+    <span style="display:flex;gap:0.5rem;align-items:center">
+      <select id="cf-filter" onchange="filterRecords()" style="width:auto;padding:0.3rem 0.6rem;font-size:0.72rem">
+        <option value="all">All</option>
+        <option value="minecraft">Minecraft SRV</option>
+        <option value="a">A records</option>
+        <option value="srv">Other SRV</option>
+        <option value="other">Other</option>
+      </select>
+      <button onclick="loadZoneRecords()" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:4px;padding:0.3rem 0.75rem;font-family:var(--mono);font-size:0.72rem;cursor:pointer">refresh</button>
+    </span>
+  </h2>
+  <div id="zone-loading" style="color:var(--muted);font-size:0.75rem;padding:0.5rem 0">loading records...</div>
+  <table id="zone-table" style="width:100%;border-collapse:collapse;font-size:0.78rem;display:none">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Type</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Name</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Content</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Label</th>
+      </tr>
+    </thead>
+    <tbody id="zone-body"></tbody>
+  </table>
+  <div id="zone-empty" style="display:none;color:var(--muted);font-size:0.75rem;padding:0.5rem 0">no records found</div>
+  <div id="zone-error" style="display:none;color:var(--accent2);font-size:0.75rem;padding:0.5rem 0"></div>
+</div>
+
 <!-- Saved DNS entries -->
 <div class="section" id="entries-section" style="display:none">
   <h2>saved server records</h2>
@@ -912,6 +1001,56 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
 
 <div class="toast" id="toast"></div>
 <script>
+
+var allZoneRecords = [];
+
+async function loadZoneRecords() {
+  document.getElementById('zone-loading').style.display = 'block';
+  document.getElementById('zone-table').style.display = 'none';
+  document.getElementById('zone-empty').style.display = 'none';
+  document.getElementById('zone-error').style.display = 'none';
+  var res  = await fetch('/api/cf/zone_records');
+  var data = await res.json();
+  document.getElementById('zone-loading').style.display = 'none';
+  if (!data.ok) {
+    var el = document.getElementById('zone-error');
+    el.textContent = data.error; el.style.display = 'block'; return;
+  }
+  allZoneRecords = data.records || [];
+  filterRecords();
+}
+
+function filterRecords() {
+  var filter = document.getElementById('cf-filter').value;
+  var rows   = allZoneRecords.filter(function(r) {
+    return filter === 'all' || r.category === filter;
+  });
+  var tbody = document.getElementById('zone-body');
+  if (!rows.length) {
+    document.getElementById('zone-table').style.display = 'none';
+    document.getElementById('zone-empty').style.display = 'block';
+    return;
+  }
+  document.getElementById('zone-empty').style.display = 'none';
+  document.getElementById('zone-table').style.display = 'table';
+
+  var catColors = {minecraft:'#00e5ff', a:'#3ddc84', srv:'#ffb347', other:'#6b6b80'};
+  tbody.innerHTML = rows.map(function(r) {
+    var typeColor = catColors[r.category] || '#6b6b80';
+    var labelCell = r.label
+      ? '<span style="color:var(--accent);font-size:0.75rem">' + esc(r.label) + '</span>'
+      : '<span style="color:var(--muted)">—</span>';
+    return '<tr>' +
+      '<td style="padding:0.55rem 0.75rem;border-bottom:1px solid var(--border)">' +
+        '<span style="background:rgba(0,0,0,0.3);border:1px solid ' + typeColor + ';color:' + typeColor + ';padding:2px 7px;border-radius:3px;font-size:0.65rem;font-weight:700">' + esc(r.type) + '</span>' +
+      '</td>' +
+      '<td style="padding:0.55rem 0.75rem;border-bottom:1px solid var(--border);color:var(--text);font-size:0.75rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.name) + '</td>' +
+      '<td style="padding:0.55rem 0.75rem;border-bottom:1px solid var(--border);color:var(--muted);font-size:0.75rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.content) + '</td>' +
+      '<td style="padding:0.55rem 0.75rem;border-bottom:1px solid var(--border)">' + labelCell + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
 const TOKEN_SET   = __TOKEN_SET__;
 const ZONE_ID_SET = __ZONE_ID_SET__;
 
@@ -919,6 +1058,7 @@ const ZONE_ID_SET = __ZONE_ID_SET__;
   var dot = document.getElementById('cfg-dot');
   dot.className = 'status-dot ' + (TOKEN_SET && ZONE_ID_SET ? 'dot-ok' : 'dot-err');
   loadEntries();
+  loadZoneRecords();
 })();
 
 function toggleGeyser() {
@@ -1006,7 +1146,7 @@ async function createDNS() {
     wrap.innerHTML = (data.results || []).map(function(r) { return '✓ ' + r; }).join('<br>');
     wrap.style.display = 'block';
     toast(data.ok ? 'records created' : 'partial success — check results', data.ok);
-    if (data.ok) loadEntries();
+    if (data.ok) { loadEntries(); loadZoneRecords(); }
   } else {
     toast(data.error || 'error', false);
   }
