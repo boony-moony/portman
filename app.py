@@ -4,13 +4,20 @@ portman - iptables DNAT port forwarding manager
 Reads existing rules, lets you add/edit/remove via web UI
 Supports optional label and domain/subdomain per rule
 Automatically manages nginx reverse proxy configs; optional SSL via certbot
+Optional Cloudflare DNS integration (A + SRV records) protected by TOTP
 """
 
 import subprocess
 import re
 import json
 import os
-from flask import Flask, request, jsonify
+import time
+import hmac
+import hashlib
+import base64
+import urllib.request
+import urllib.error
+from flask import Flask, request, jsonify, session, redirect, url_for, make_response
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -19,13 +26,14 @@ app.secret_key = os.environ.get("SECRET_KEY", "change-this-in-production")
 auth = HTTPBasicAuth()
 
 # --- Config ---
-USERNAME = os.environ.get("PORTMAN_USER", "admin")
+USERNAME      = os.environ.get("PORTMAN_USER", "admin")
 PASSWORD_HASH = generate_password_hash(os.environ.get("PORTMAN_PASS", "admin"))
 DEFAULT_DEST_IP = os.environ.get("DEST_IP", "")
-WAN_IFACE = os.environ.get("WAN_IFACE", "eth0")
+WAN_IFACE     = os.environ.get("WAN_IFACE", "eth0")
 
 LABELS_FILE   = "/opt/portman/labels.json"
 SETTINGS_FILE = "/opt/portman/settings.json"
+CF_AUTH_FILE  = "/opt/portman/cf_auth.json"
 NGINX_AVAIL   = "/etc/nginx/sites-available"
 NGINX_ENABLED = "/etc/nginx/sites-enabled"
 
@@ -67,7 +75,7 @@ def load_settings():
         with open(SETTINGS_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"certbot_email": ""}
+        return {"certbot_email": "", "cloudflare_enabled": False}
 
 def save_settings(settings):
     try:
@@ -77,10 +85,124 @@ def save_settings(settings):
     except Exception as e:
         print(f"Error saving settings: {e}")
 
+# ── Cloudflare auth (TOTP + password, stored separately) ────────────────────
+
+def load_cf_auth():
+    try:
+        with open(CF_AUTH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_cf_auth(data):
+    os.makedirs(os.path.dirname(CF_AUTH_FILE), exist_ok=True)
+    with open(CF_AUTH_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(CF_AUTH_FILE, 0o600)
+
+def cf_is_setup():
+    d = load_cf_auth()
+    return bool(d.get("password_hash")) and bool(d.get("totp_secret"))
+
+def cf_session_valid():
+    return session.get("cf_authed") and time.time() - session.get("cf_authed_at", 0) < 3600
+
+# ── TOTP (RFC 6238) — no external lib required ──────────────────────────────
+
+def _totp_generate_secret():
+    return base64.b32encode(os.urandom(20)).decode("utf-8")
+
+def _totp_code(secret, t=None):
+    if t is None:
+        t = int(time.time()) // 30
+    key = base64.b32decode(secret.upper())
+    msg = t.to_bytes(8, "big")
+    h   = hmac.new(key, msg, hashlib.sha1).digest()
+    o   = h[-1] & 0x0F
+    code = (int.from_bytes(h[o:o+4], "big") & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+def totp_verify(secret, code):
+    code = str(code).strip()
+    for delta in (-1, 0, 1):
+        if hmac.compare_digest(_totp_code(secret, int(time.time()) // 30 + delta), code):
+            return True
+    return False
+
+def totp_provisioning_uri(secret, account="portman-cloudflare", issuer="portman"):
+    return f"otpauth://totp/{issuer}:{account}?secret={secret}&issuer={issuer}"
+
+# ── Cloudflare API helpers ───────────────────────────────────────────────────
+
+def cf_api(method, path, payload=None):
+    d = load_cf_auth()
+    token   = d.get("api_token", "")
+    zone_id = d.get("zone_id", "")
+    if not token or not zone_id:
+        raise RuntimeError("Cloudflare API token or Zone ID not configured")
+    url  = f"https://api.cloudflare.com/client/v4/zones/{zone_id}{path}"
+    data = json.dumps(payload).encode() if payload else None
+    req  = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise RuntimeError(f"CF API {e.code}: {body}")
+
+def cf_list_records(name=None, rtype=None):
+    params = []
+    if name:  params.append(f"name={urllib.parse.quote(name)}")
+    if rtype: params.append(f"type={rtype}")
+    qs = ("?" + "&".join(params)) if params else ""
+    return cf_api("GET", f"/dns_records{qs}")
+
+def cf_create_a_record(name, ip):
+    """Create A record if it doesn't already exist."""
+    import urllib.parse
+    existing = cf_list_records(name=name, rtype="A")
+    for r in existing.get("result", []):
+        if r["name"] == name:
+            return {"ok": True, "msg": "A record already exists"}
+    result = cf_api("POST", "/dns_records", {
+        "type": "A", "name": name, "content": ip, "ttl": 1, "proxied": False
+    })
+    if not result.get("success"):
+        raise RuntimeError(str(result.get("errors")))
+    return {"ok": True, "msg": "A record created"}
+
+def cf_create_srv_record(subdomain, target, port, proto="tcp"):
+    """Create SRV record for Minecraft. subdomain = e.g. 'fly' for fly.linuslinus.com"""
+    import urllib.parse
+    d = load_cf_auth()
+    zone_name = d.get("zone_name", "")
+    srv_name  = f"_minecraft._{proto}.{subdomain}"
+    existing  = cf_list_records(name=f"{srv_name}.{zone_name}", rtype="SRV")
+    for r in existing.get("result", []):
+        if r["name"].startswith(f"_minecraft._{proto}.{subdomain}"):
+            return {"ok": True, "msg": "SRV record already exists"}
+    result = cf_api("POST", "/dns_records", {
+        "type": "SRV",
+        "data": {
+            "name":     srv_name,
+            "service":  "_minecraft",
+            "proto":    f"_{proto}",
+            "priority": 0,
+            "weight":   5,
+            "port":     int(port),
+            "target":   target
+        },
+        "ttl": 1
+    })
+    if not result.get("success"):
+        raise RuntimeError(str(result.get("errors")))
+    return {"ok": True, "msg": "SRV record created"}
+
 # ── nginx helpers ────────────────────────────────────────────────────────────
 
 def _valid_domain(domain):
-    """Basic domain validation to prevent command/path injection."""
     return bool(domain) and bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$', domain)) and '..' not in domain
 
 def _nginx_present():
@@ -135,7 +257,7 @@ def ssl_active(domain):
 # ── iptables helpers ─────────────────────────────────────────────────────────
 
 def get_existing_rules():
-    rules = []
+    rules  = []
     labels = load_labels()
     try:
         output = run("iptables -t nat -L PREROUTING -n --line-numbers")
@@ -188,12 +310,14 @@ def persist():
         except Exception:
             pass
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes — main app ────────────────────────────────────────────────────────
 
 @app.route("/")
 @auth.login_required
 def index():
-    return HTML_PAGE
+    settings = load_settings()
+    cf_enabled = settings.get("cloudflare_enabled", False)
+    return HTML_PAGE.replace("__CF_ENABLED__", "true" if cf_enabled else "false")
 
 @app.route("/api/rules", methods=["GET"])
 @auth.login_required
@@ -243,9 +367,8 @@ def api_edit():
         assert 1 <= new_src_port <= 65535
         assert 1 <= new_dest_port <= 65535
 
-        # Get old domain before we overwrite labels
-        labels   = load_labels()
-        old_key  = label_key(old_proto, old_src_port)
+        labels     = load_labels()
+        old_key    = label_key(old_proto, old_src_port)
         old_domain = labels.get(old_key, {}).get("domain", "")
 
         remove_rule(old_proto, old_src_port, old_dest_ip, old_dest_port)
@@ -256,7 +379,6 @@ def api_edit():
         labels[label_key(new_proto, new_src_port)] = {"label": label, "domain": new_domain}
         save_labels(labels)
 
-        # Update nginx: remove old config if domain changed
         if old_domain and old_domain != new_domain:
             remove_nginx_config(old_domain)
         if new_domain:
@@ -298,7 +420,7 @@ def api_get_settings():
 @app.route("/api/settings", methods=["POST"])
 @auth.login_required
 def api_save_settings():
-    data = request.json
+    data     = request.json
     settings = load_settings()
     if "certbot_email" in data:
         settings["certbot_email"] = data["certbot_email"].strip()
@@ -330,7 +452,581 @@ def api_ssl():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── Embedded HTML ─────────────────────────────────────────────────────────────
+# ── Routes — Cloudflare ──────────────────────────────────────────────────────
+
+@app.route("/cloudflare")
+@auth.login_required
+def cf_page():
+    settings = load_settings()
+    if not settings.get("cloudflare_enabled", False):
+        return "Cloudflare integration is not enabled.", 403
+    if not cf_is_setup():
+        return CF_SETUP_PAGE
+    if not cf_session_valid():
+        return CF_LOGIN_PAGE
+    d = load_cf_auth()
+    token_set   = bool(d.get("api_token"))
+    zone_id_set = bool(d.get("zone_id"))
+    zone_name   = d.get("zone_name", "")
+    return CF_MAIN_PAGE \
+        .replace("__TOKEN_SET__",   "true" if token_set else "false") \
+        .replace("__ZONE_ID_SET__", "true" if zone_id_set else "false") \
+        .replace("__ZONE_NAME__",   zone_name)
+
+@app.route("/api/cf/setup", methods=["POST"])
+@auth.login_required
+def cf_setup():
+    settings = load_settings()
+    if not settings.get("cloudflare_enabled", False):
+        return jsonify({"ok": False, "error": "not enabled"}), 403
+    if cf_is_setup():
+        return jsonify({"ok": False, "error": "already set up"}), 400
+    data     = request.json
+    password = data.get("password", "").strip()
+    secret   = data.get("totp_secret", "").strip()
+    code     = data.get("totp_code", "").strip()
+    if len(password) < 8:
+        return jsonify({"ok": False, "error": "password must be at least 8 characters"})
+    if not secret or not totp_verify(secret, code):
+        return jsonify({"ok": False, "error": "invalid TOTP code — scan the QR code and enter the 6-digit code"})
+    save_cf_auth({"password_hash": generate_password_hash(password), "totp_secret": secret})
+    session["cf_authed"]    = True
+    session["cf_authed_at"] = time.time()
+    return jsonify({"ok": True})
+
+@app.route("/api/cf/generate-totp", methods=["POST"])
+@auth.login_required
+def cf_generate_totp():
+    settings = load_settings()
+    if not settings.get("cloudflare_enabled", False):
+        return jsonify({"ok": False, "error": "not enabled"}), 403
+    secret = _totp_generate_secret()
+    uri    = totp_provisioning_uri(secret)
+    return jsonify({"ok": True, "secret": secret, "uri": uri})
+
+@app.route("/api/cf/login", methods=["POST"])
+@auth.login_required
+def cf_login():
+    settings = load_settings()
+    if not settings.get("cloudflare_enabled", False):
+        return jsonify({"ok": False, "error": "not enabled"}), 403
+    data     = request.json
+    password = data.get("password", "").strip()
+    code     = data.get("totp_code", "").strip()
+    d        = load_cf_auth()
+    if not check_password_hash(d.get("password_hash", ""), password):
+        return jsonify({"ok": False, "error": "invalid password"})
+    if not totp_verify(d.get("totp_secret", ""), code):
+        return jsonify({"ok": False, "error": "invalid TOTP code"})
+    session["cf_authed"]    = True
+    session["cf_authed_at"] = time.time()
+    return jsonify({"ok": True})
+
+@app.route("/api/cf/logout", methods=["POST"])
+@auth.login_required
+def cf_logout():
+    session.pop("cf_authed", None)
+    session.pop("cf_authed_at", None)
+    return jsonify({"ok": True})
+
+@app.route("/api/cf/config", methods=["GET"])
+@auth.login_required
+def cf_get_config():
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    d = load_cf_auth()
+    return jsonify({
+        "ok":          True,
+        "token_set":   bool(d.get("api_token")),
+        "zone_id_set": bool(d.get("zone_id")),
+        "zone_name":   d.get("zone_name", ""),
+    })
+
+@app.route("/api/cf/config", methods=["POST"])
+@auth.login_required
+def cf_save_config():
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    data      = request.json
+    d         = load_cf_auth()
+    api_token = data.get("api_token", "").strip()
+    zone_id   = data.get("zone_id", "").strip()
+    zone_name = data.get("zone_name", "").strip()
+    if api_token:
+        d["api_token"] = api_token
+    if zone_id:
+        d["zone_id"] = zone_id
+    if zone_name:
+        d["zone_name"] = zone_name
+    save_cf_auth(d)
+    return jsonify({"ok": True})
+
+@app.route("/api/cf/dns", methods=["POST"])
+@auth.login_required
+def cf_create_dns():
+    """Create A record + TCP SRV (and optionally UDP SRV) for a rule."""
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    data        = request.json
+    label       = data.get("label", "").strip()
+    subdomain   = data.get("subdomain", "").strip()
+    full_domain = data.get("full_domain", "").strip()
+    linode_ip   = data.get("linode_ip", "").strip()
+    srv_target  = data.get("srv_target", "").strip()
+    port        = int(data.get("port", 0))
+    add_udp     = data.get("add_udp", False)
+    geyser_port = data.get("geyser_port", 0)
+
+    if not all([subdomain, full_domain, linode_ip, srv_target, port]):
+        return jsonify({"ok": False, "error": "missing required fields"})
+
+    results = []
+    try:
+        r = cf_create_a_record(full_domain, linode_ip)
+        results.append(f"A record: {r['msg']}")
+
+        r = cf_create_srv_record(subdomain, srv_target, port, "tcp")
+        results.append(f"SRV TCP: {r['msg']}")
+
+        if add_udp:
+            r = cf_create_srv_record(subdomain, srv_target, port, "udp")
+            results.append(f"SRV UDP: {r['msg']}")
+
+        if geyser_port:
+            r = cf_create_srv_record(subdomain, srv_target, geyser_port, "udp")
+            results.append(f"Geyser SRV UDP ({geyser_port}): {r['msg']}")
+
+        # Save entry to cf_auth so it shows in the records list
+        d = load_cf_auth()
+        entries = d.get("dns_entries", [])
+        entries.append({
+            "label":       label or subdomain,
+            "subdomain":   subdomain,
+            "full_domain": full_domain,
+            "port":        port,
+            "geyser_port": geyser_port or None,
+            "add_udp":     add_udp,
+        })
+        d["dns_entries"] = entries
+        save_cf_auth(d)
+
+        return jsonify({"ok": True, "results": results})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "partial": results})
+
+@app.route("/api/cf/dns", methods=["GET"])
+@auth.login_required
+def cf_list_dns():
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    d = load_cf_auth()
+    return jsonify({"ok": True, "entries": d.get("dns_entries", [])})
+
+@app.route("/api/cf/dns/<int:index>", methods=["DELETE"])
+@auth.login_required
+def cf_delete_dns(index):
+    if not cf_session_valid():
+        return jsonify({"ok": False, "error": "not authenticated"}), 401
+    d = load_cf_auth()
+    entries = d.get("dns_entries", [])
+    if 0 <= index < len(entries):
+        entries.pop(index)
+        d["dns_entries"] = entries
+        save_cf_auth(d)
+    return jsonify({"ok": True})
+
+# ── Cloudflare pages (embedded HTML) ─────────────────────────────────────────
+
+CF_SETUP_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>portman — cloudflare setup</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0d0d0f; --surface:#15151a; --border:#2a2a35; --accent:#00e5ff; --accent2:#ff4d6d; --text:#e8e8f0; --muted:#6b6b80; --mono:'JetBrains Mono',monospace; --display:'Syne',sans-serif; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:var(--mono); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:2rem; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:2.5rem; width:100%; max-width:440px; }
+  h1 { font-family:var(--display); color:var(--accent); font-size:1.6rem; margin-bottom:0.25rem; }
+  .sub { color:var(--muted); font-size:0.75rem; margin-bottom:2rem; }
+  label { display:block; font-size:0.65rem; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-top:1.25rem; margin-bottom:0.4rem; }
+  input { width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); font-family:var(--mono); font-size:0.85rem; padding:0.6rem 0.8rem; border-radius:4px; outline:none; transition:border-color 0.15s; }
+  input:focus { border-color:var(--accent); }
+  .btn { margin-top:1.5rem; width:100%; background:var(--accent); color:#000; border:none; border-radius:4px; padding:0.75rem; font-family:var(--mono); font-size:0.85rem; font-weight:700; cursor:pointer; letter-spacing:1px; transition:opacity 0.15s; }
+  .btn:hover { opacity:0.85; } .btn:disabled { opacity:0.4; cursor:default; }
+  .qr-wrap { margin-top:1.25rem; text-align:center; }
+  .qr-wrap img { border:4px solid white; border-radius:4px; max-width:200px; }
+  .qr-wrap .secret { font-size:0.7rem; color:var(--muted); margin-top:0.5rem; word-break:break-all; }
+  .btn-gen { background:none; border:1px solid var(--border); color:var(--accent); border-radius:4px; padding:0.5rem 1rem; font-family:var(--mono); font-size:0.75rem; cursor:pointer; margin-top:1rem; width:100%; transition:all 0.15s; }
+  .btn-gen:hover { border-color:var(--accent); }
+  .err { color:var(--accent2); font-size:0.75rem; margin-top:0.75rem; display:none; }
+  .ok  { color:#3ddc84; font-size:0.75rem; margin-top:0.75rem; display:none; }
+  .warn { background:rgba(255,179,71,0.08); border:1px solid rgba(255,179,71,0.3); color:#ffb347; border-radius:4px; padding:0.75rem 1rem; font-size:0.72rem; margin-bottom:1.5rem; line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>cloudflare setup</h1>
+  <p class="sub">first-time setup — this runs once</p>
+  <div class="warn">&#9888; Set a strong password and save the TOTP secret somewhere safe. If you lose access you will need to manually delete <code>/opt/portman/cf_auth.json</code> and redo setup.</div>
+
+  <label>Password <span style="font-size:0.6rem;opacity:0.6">(min 8 chars)</span></label>
+  <input type="password" id="password" placeholder="choose a strong password">
+
+  <label>Confirm password</label>
+  <input type="password" id="password2" placeholder="confirm password">
+
+  <label>Authenticator app</label>
+  <button class="btn-gen" onclick="generateTOTP()">Generate QR code</button>
+  <div class="qr-wrap" id="qr-wrap" style="display:none">
+    <img id="qr-img" src="" alt="QR code">
+    <div class="secret" id="totp-secret-display"></div>
+  </div>
+  <input type="hidden" id="totp-secret" value="">
+
+  <label>TOTP code <span style="font-size:0.6rem;opacity:0.6">(from your authenticator)</span></label>
+  <input type="text" id="totp-code" placeholder="000000" maxlength="6" autocomplete="one-time-code">
+
+  <div class="err" id="err"></div>
+  <button class="btn" id="btn" onclick="doSetup()">COMPLETE SETUP</button>
+</div>
+<script>
+async function generateTOTP() {
+  var res  = await fetch('/api/cf/generate-totp', {method:'POST'});
+  var data = await res.json();
+  if (!data.ok) { showErr(data.error); return; }
+  document.getElementById('totp-secret').value = data.secret;
+  document.getElementById('totp-secret-display').textContent = 'Manual key: ' + data.secret;
+  // Use a QR code API to render the otpauth URI
+  var qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(data.uri);
+  document.getElementById('qr-img').src = qrUrl;
+  document.getElementById('qr-wrap').style.display = 'block';
+}
+async function doSetup() {
+  var pw  = document.getElementById('password').value;
+  var pw2 = document.getElementById('password2').value;
+  var sec = document.getElementById('totp-secret').value;
+  var cod = document.getElementById('totp-code').value.trim();
+  if (pw !== pw2) { showErr('passwords do not match'); return; }
+  if (!sec) { showErr('generate a QR code first'); return; }
+  if (!cod) { showErr('enter the 6-digit code from your authenticator'); return; }
+  var btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = 'SETTING UP...';
+  var res  = await fetch('/api/cf/setup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password:pw, totp_secret:sec, totp_code:cod})});
+  var data = await res.json();
+  btn.disabled = false; btn.textContent = 'COMPLETE SETUP';
+  if (data.ok) { window.location.href = '/cloudflare'; }
+  else showErr(data.error);
+}
+function showErr(msg) { var e = document.getElementById('err'); e.textContent = msg; e.style.display = 'block'; }
+</script>
+</body>
+</html>"""
+
+CF_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>portman — cloudflare login</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0d0d0f; --surface:#15151a; --border:#2a2a35; --accent:#00e5ff; --accent2:#ff4d6d; --text:#e8e8f0; --muted:#6b6b80; --mono:'JetBrains Mono',monospace; --display:'Syne',sans-serif; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:var(--mono); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:2rem; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:2.5rem; width:100%; max-width:380px; }
+  h1 { font-family:var(--display); color:var(--accent); font-size:1.6rem; margin-bottom:0.25rem; }
+  .sub { color:var(--muted); font-size:0.75rem; margin-bottom:2rem; }
+  label { display:block; font-size:0.65rem; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-top:1.25rem; margin-bottom:0.4rem; }
+  input { width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); font-family:var(--mono); font-size:0.85rem; padding:0.6rem 0.8rem; border-radius:4px; outline:none; transition:border-color 0.15s; }
+  input:focus { border-color:var(--accent); }
+  .btn { margin-top:1.5rem; width:100%; background:var(--accent); color:#000; border:none; border-radius:4px; padding:0.75rem; font-family:var(--mono); font-size:0.85rem; font-weight:700; cursor:pointer; letter-spacing:1px; transition:opacity 0.15s; }
+  .btn:hover { opacity:0.85; } .btn:disabled { opacity:0.4; cursor:default; }
+  .err { color:var(--accent2); font-size:0.75rem; margin-top:0.75rem; display:none; }
+  .back { display:block; text-align:center; margin-top:1rem; font-size:0.72rem; color:var(--muted); text-decoration:none; }
+  .back:hover { color:var(--text); }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>cloudflare</h1>
+  <p class="sub">authentication required</p>
+  <label>Password</label>
+  <input type="password" id="password" placeholder="cloudflare page password">
+  <label>TOTP code</label>
+  <input type="text" id="totp-code" placeholder="000000" maxlength="6" autocomplete="one-time-code">
+  <div class="err" id="err"></div>
+  <button class="btn" id="btn" onclick="doLogin()">UNLOCK</button>
+  <a href="/" class="back">← back to portman</a>
+</div>
+<script>
+async function doLogin() {
+  var pw  = document.getElementById('password').value;
+  var cod = document.getElementById('totp-code').value.trim();
+  var btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = 'CHECKING...';
+  var res  = await fetch('/api/cf/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw, totp_code:cod})});
+  var data = await res.json();
+  btn.disabled = false; btn.textContent = 'UNLOCK';
+  if (data.ok) { window.location.href = '/cloudflare'; }
+  else { var e = document.getElementById('err'); e.textContent = data.error; e.style.display = 'block'; }
+}
+document.addEventListener('keydown', function(e) { if (e.key === 'Enter') doLogin(); });
+</script>
+</body>
+</html>"""
+
+CF_MAIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>portman — cloudflare</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#0d0d0f; --surface:#15151a; --border:#2a2a35; --accent:#00e5ff; --accent2:#ff4d6d; --text:#e8e8f0; --muted:#6b6b80; --tcp:#3ddc84; --mono:'JetBrains Mono',monospace; --display:'Syne',sans-serif; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:var(--mono); min-height:100vh; padding:2rem; max-width:860px; margin:0 auto; }
+  header { display:flex; align-items:center; gap:1rem; margin-bottom:2rem; border-bottom:1px solid var(--border); padding-bottom:1.5rem; }
+  header h1 { font-family:var(--display); font-size:2rem; font-weight:800; color:var(--accent); letter-spacing:-1px; }
+  .sub { color:var(--muted); font-size:0.75rem; }
+  .back { margin-left:auto; background:none; border:1px solid var(--border); color:var(--muted); border-radius:4px; padding:5px 14px; font-family:var(--mono); font-size:0.72rem; cursor:pointer; text-decoration:none; transition:all 0.15s; }
+  .back:hover { border-color:var(--accent); color:var(--accent); }
+  .section { background:var(--surface); border:1px solid var(--border); border-radius:6px; padding:1.5rem; margin-bottom:1.5rem; }
+  .section h2 { font-size:0.65rem; text-transform:uppercase; letter-spacing:2px; color:var(--muted); margin-bottom:1.25rem; }
+  label { display:block; font-size:0.65rem; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-top:1rem; margin-bottom:0.4rem; }
+  label:first-of-type { margin-top:0; }
+  input, select { width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); font-family:var(--mono); font-size:0.85rem; padding:0.6rem 0.8rem; border-radius:4px; outline:none; transition:border-color 0.15s; }
+  input:focus, select:focus { border-color:var(--accent); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+  .btn { background:var(--accent); color:#000; border:none; border-radius:4px; padding:0.6rem 1.25rem; font-family:var(--mono); font-size:0.8rem; font-weight:700; cursor:pointer; letter-spacing:1px; transition:opacity 0.15s; margin-top:1rem; }
+  .btn:hover { opacity:0.85; } .btn:disabled { opacity:0.4; cursor:default; }
+  .btn-danger { background:none; border:1px solid var(--accent2); color:var(--accent2); border-radius:4px; padding:0.5rem 1rem; font-family:var(--mono); font-size:0.75rem; cursor:pointer; transition:all 0.15s; }
+  .btn-danger:hover { background:rgba(255,77,109,0.1); }
+  .check { display:flex; align-items:center; gap:0.5rem; font-size:0.8rem; margin-top:0.75rem; }
+  .check input { width:auto; padding:0; accent-color:var(--accent); }
+  .toast { position:fixed; bottom:2rem; right:2rem; padding:0.75rem 1.25rem; border-radius:5px; font-size:0.8rem; opacity:0; transform:translateY(10px); transition:all 0.2s; pointer-events:none; z-index:999; }
+  .toast.show { opacity:1; transform:translateY(0); }
+  .toast.ok  { background:rgba(61,220,132,0.15); border:1px solid var(--tcp); color:var(--tcp); }
+  .toast.err { background:rgba(255,77,109,0.15); border:1px solid var(--accent2); color:var(--accent2); }
+  .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot-ok  { background:var(--tcp); }
+  .dot-err { background:var(--accent2); }
+  .results { margin-top:1rem; font-size:0.75rem; color:var(--tcp); line-height:1.8; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cloudflare</h1>
+  <span class="sub">DNS record manager</span>
+  <a href="/" class="back">← portman</a>
+</header>
+
+<!-- API config -->
+<div class="section">
+  <h2>API configuration
+    <span class="status-dot __TOKEN_SET__ __ZONE_ID_SET__" id="cfg-dot"
+      style="margin-left:8px"
+      class="status-dot"></span>
+  </h2>
+  <label>API Token <span style="font-size:0.6rem;opacity:0.6">(leave blank to keep existing)</span></label>
+  <input type="password" id="api-token" placeholder="Cloudflare API token">
+  <div class="row">
+    <div>
+      <label>Zone ID</label>
+      <input type="text" id="zone-id" placeholder="Zone ID from CF dashboard">
+    </div>
+    <div>
+      <label>Zone name <span style="font-size:0.6rem;opacity:0.6">(e.g. linuslinus.com)</span></label>
+      <input type="text" id="zone-name" placeholder="yourdomain.com" value="__ZONE_NAME__">
+    </div>
+  </div>
+  <button class="btn" onclick="saveConfig()">SAVE CONFIG</button>
+</div>
+
+<!-- Saved DNS entries -->
+<div class="section" id="entries-section" style="display:none">
+  <h2>saved server records</h2>
+  <table id="entries-table" style="width:100%;border-collapse:collapse;font-size:0.8rem">
+    <thead>
+      <tr>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Label</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Domain</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Port</th>
+        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Geyser</th>
+        <th style="border-bottom:1px solid var(--border)"></th>
+      </tr>
+    </thead>
+    <tbody id="entries-body"></tbody>
+  </table>
+</div>
+
+<!-- Create DNS records -->
+<div class="section">
+  <h2>Create DNS records for a server</h2>
+  <label>Label <span style="font-size:0.6rem;opacity:0.6">(display name, e.g. "Survival server")</span></label>
+  <input type="text" id="dns-label" placeholder="e.g. Survival server">
+  <div class="row" style="margin-top:0">
+    <div>
+      <label>Subdomain <span style="font-size:0.6rem;opacity:0.6">(e.g. fly)</span></label>
+      <input type="text" id="subdomain" placeholder="fly">
+    </div>
+    <div>
+      <label>Linode public IP</label>
+      <input type="text" id="linode-ip" placeholder="172.232.147.23">
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>SRV target <span style="font-size:0.6rem;opacity:0.6">(A record to point SRV at)</span></label>
+      <input type="text" id="srv-target" placeholder="srv.linuslinus.com">
+    </div>
+    <div>
+      <label>Java port</label>
+      <input type="number" id="java-port" placeholder="25580" min="1" max="65535">
+    </div>
+  </div>
+  <div class="check">
+    <input type="checkbox" id="add-udp">
+    <label style="margin:0;text-transform:none;letter-spacing:0;font-size:0.8rem;color:var(--text)">Also create UDP SRV (Java)</label>
+  </div>
+  <div class="check">
+    <input type="checkbox" id="add-geyser" onchange="toggleGeyser()">
+    <label style="margin:0;text-transform:none;letter-spacing:0;font-size:0.8rem;color:var(--text)">Add Geyser (Bedrock) SRV</label>
+  </div>
+  <div id="geyser-port-wrap" style="display:none;margin-top:0.75rem">
+    <label>Geyser port</label>
+    <input type="number" id="geyser-port" placeholder="19132" min="1" max="65535">
+  </div>
+  <button class="btn" id="dns-btn" onclick="createDNS()">CREATE RECORDS</button>
+  <div class="results" id="results"></div>
+</div>
+
+<!-- Session -->
+<div class="section" style="display:flex;align-items:center;justify-content:space-between">
+  <span style="font-size:0.75rem;color:var(--muted)">Session expires in 1 hour</span>
+  <button class="btn-danger" onclick="doLogout()">log out</button>
+</div>
+
+<div class="toast" id="toast"></div>
+<script>
+const TOKEN_SET   = __TOKEN_SET__;
+const ZONE_ID_SET = __ZONE_ID_SET__;
+
+(function() {
+  var dot = document.getElementById('cfg-dot');
+  dot.className = 'status-dot ' + (TOKEN_SET && ZONE_ID_SET ? 'dot-ok' : 'dot-err');
+  loadEntries();
+})();
+
+function toggleGeyser() {
+  document.getElementById('geyser-port-wrap').style.display =
+    document.getElementById('add-geyser').checked ? 'block' : 'none';
+}
+
+async function loadEntries() {
+  var res  = await fetch('/api/cf/dns');
+  var data = await res.json();
+  if (!data.ok) return;
+  var entries = data.entries || [];
+  var section = document.getElementById('entries-section');
+  var tbody   = document.getElementById('entries-body');
+  if (!entries.length) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  tbody.innerHTML = entries.map(function(e, i) {
+    return '<tr>' +
+      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--accent)">' + esc(e.label) + '</td>' +
+      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--muted)">' + esc(e.full_domain) + '</td>' +
+      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border)">' + e.port + '</td>' +
+      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--muted)">' + (e.geyser_port || '—') + '</td>' +
+      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);text-align:right">' +
+        '<button onclick="removeEntry(' + i + ')" style="background:none;border:1px solid var(--accent2);color:var(--accent2);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">remove</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function removeEntry(i) {
+  if (!confirm('Remove this entry from the list? (DNS records on Cloudflare are NOT deleted)')) return;
+  var res  = await fetch('/api/cf/dns/' + i, {method:'DELETE'});
+  var data = await res.json();
+  if (data.ok) loadEntries();
+  else toast(data.error || 'error', false);
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function saveConfig() {
+  var payload = {
+    api_token: document.getElementById('api-token').value.trim(),
+    zone_id:   document.getElementById('zone-id').value.trim(),
+    zone_name: document.getElementById('zone-name').value.trim(),
+  };
+  var res  = await fetch('/api/cf/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  var data = await res.json();
+  toast(data.ok ? 'config saved' : (data.error || 'error'), data.ok);
+  if (data.ok) document.getElementById('api-token').value = '';
+}
+
+async function createDNS() {
+  var label       = document.getElementById('dns-label').value.trim();
+  var subdomain   = document.getElementById('subdomain').value.trim();
+  var linodeIp    = document.getElementById('linode-ip').value.trim();
+  var srvTarget   = document.getElementById('srv-target').value.trim();
+  var javaPort    = parseInt(document.getElementById('java-port').value);
+  var addUdp      = document.getElementById('add-udp').checked;
+  var addGeyser   = document.getElementById('add-geyser').checked;
+  var geyserPort  = addGeyser ? parseInt(document.getElementById('geyser-port').value) : 0;
+  var zoneName    = document.getElementById('zone-name').value.trim();
+
+  if (!subdomain || !linodeIp || !srvTarget || !javaPort) { toast('fill in all required fields', false); return; }
+
+  var fullDomain = subdomain + (zoneName ? '.' + zoneName : '');
+  var btn = document.getElementById('dns-btn');
+  btn.disabled = true; btn.textContent = 'CREATING...';
+
+  var res = await fetch('/api/cf/dns', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      label: label, subdomain: subdomain, full_domain: fullDomain,
+      linode_ip: linodeIp, srv_target: srvTarget,
+      port: javaPort, add_udp: addUdp, geyser_port: geyserPort
+    })
+  });
+  var data = await res.json();
+  btn.disabled = false; btn.textContent = 'CREATE RECORDS';
+
+  if (data.ok || data.partial) {
+    var wrap = document.getElementById('results');
+    wrap.innerHTML = (data.results || []).map(function(r) { return '✓ ' + r; }).join('<br>');
+    wrap.style.display = 'block';
+    toast(data.ok ? 'records created' : 'partial success — check results', data.ok);
+    if (data.ok) loadEntries();
+  } else {
+    toast(data.error || 'error', false);
+  }
+}
+
+async function doLogout() {
+  await fetch('/api/cf/logout', {method:'POST'});
+  window.location.href = '/cloudflare';
+}
+
+function toast(msg, ok) {
+  var t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast show ' + (ok ? 'ok' : 'err');
+  setTimeout(function() { t.className = 'toast'; }, 3000);
+}
+</script>
+</body>
+</html>"""
+
+# ── Main page HTML ────────────────────────────────────────────────────────────
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -367,8 +1063,8 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   header h1 { font-family: var(--display); font-size: 2rem; font-weight: 800; color: var(--accent); letter-spacing: -1px; }
   header .subtitle { color: var(--muted); font-size: 0.8rem; }
-  .btn-settings {
-    margin-left: auto;
+  .header-btns { margin-left: auto; display: flex; gap: 0.5rem; }
+  .btn-settings, .btn-cf {
     background: none;
     border: 1px solid var(--border);
     color: var(--muted);
@@ -379,10 +1075,12 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor: pointer;
     transition: all 0.15s;
     letter-spacing: 0.5px;
+    text-decoration: none;
+    display: inline-block;
   }
   .btn-settings:hover, .btn-settings.active { border-color: var(--accent); color: var(--accent); }
+  .btn-cf:hover { border-color: #f6821f; color: #f6821f; }
 
-  /* Settings bar */
   .settings-bar {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -410,11 +1108,9 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .btn-save:hover { border-color: var(--accent); color: var(--accent); }
 
-  /* Grid */
   .grid { display: grid; grid-template-columns: 1fr 380px; gap: 2rem; align-items: start; }
   @media(max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
 
-  /* Table */
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
   .panel-header {
     padding: 1rem 1.25rem;
@@ -469,7 +1165,6 @@ HTML_PAGE = """<!DOCTYPE html>
   .btn-remove:hover { background: rgba(255,77,109,0.15); }
   .empty-row td { color: var(--muted); text-align: center; padding: 2.5rem; font-size: 0.8rem; }
 
-  /* Form */
   .form-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1.5rem; }
   .form-panel h2 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: var(--muted); margin-bottom: 1.5rem; transition: color 0.15s; }
   .form-panel h2.edit-mode { color: var(--accent); }
@@ -484,7 +1179,6 @@ HTML_PAGE = """<!DOCTYPE html>
   input:focus, select:focus { border-color: var(--accent); }
   select option { background: var(--bg); }
 
-  /* SSL option */
   .ssl-option {
     margin-top: 0.75rem;
     padding: 0.6rem 0.8rem;
@@ -501,7 +1195,6 @@ HTML_PAGE = """<!DOCTYPE html>
     width: auto; padding: 0; border: none; background: none;
     cursor: pointer; accent-color: var(--accent);
   }
-  .ssl-status { font-size: 0.72rem; color: var(--tcp); margin-top: 0.5rem; display: none; }
 
   .btn-add {
     margin-top: 1.5rem; width: 100%; background: var(--accent); color: #000;
@@ -531,7 +1224,10 @@ HTML_PAGE = """<!DOCTYPE html>
 <header>
   <h1>portman</h1>
   <span class="subtitle">iptables DNAT manager &mdash; """ + (DEFAULT_DEST_IP or "set DEST_IP env") + """</span>
-  <button class="btn-settings" id="settings-btn" onclick="toggleSettings()">settings</button>
+  <div class="header-btns">
+    <button class="btn-settings" id="settings-btn" onclick="toggleSettings()">settings</button>
+    <a href="/cloudflare" class="btn-cf" id="cf-btn" style="display:none">cloudflare</a>
+  </div>
 </header>
 
 <div class="settings-bar" id="settings-bar" style="display:none">
@@ -603,17 +1299,17 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 const DEFAULT_DEST_IP = '""" + DEFAULT_DEST_IP + """';
+const CF_ENABLED = __CF_ENABLED__;
 
 let rules    = [];
 let editMode = false;
 let editIdx  = -1;
 
-// ── Init ──────────────────────────────────────────────────────────────────
 async function init() {
   await Promise.all([loadRules(), loadSettings()]);
+  if (CF_ENABLED) document.getElementById('cf-btn').style.display = 'inline-block';
 }
 
-// ── Settings ──────────────────────────────────────────────────────────────
 function toggleSettings() {
   var bar = document.getElementById('settings-bar');
   var btn = document.getElementById('settings-btn');
@@ -639,7 +1335,6 @@ async function saveSettings() {
   toast(data.ok ? 'settings saved' : (data.error || 'error'), data.ok);
 }
 
-// ── Rules ─────────────────────────────────────────────────────────────────
 async function loadRules() {
   var res = await fetch('/api/rules');
   rules = await res.json();
@@ -684,7 +1379,6 @@ function render() {
   }).join('');
 }
 
-// ── Form helpers ──────────────────────────────────────────────────────────
 function onDomainInput() {
   var val = document.getElementById('domain').value.trim();
   document.getElementById('ssl-option').style.display = val ? 'block' : 'none';
@@ -729,7 +1423,6 @@ function cancelEdit() {
   document.getElementById('domain').value   = '';
 }
 
-// ── Submit ────────────────────────────────────────────────────────────────
 async function submitRule() {
   var proto     = document.getElementById('proto').value;
   var src_port  = parseInt(document.getElementById('src_port').value);
@@ -793,7 +1486,6 @@ async function requestCert(domain) {
   if (data.ok) loadRules();
 }
 
-// ── Remove ────────────────────────────────────────────────────────────────
 async function removeRule(i) {
   var r = rules[i];
   if (!confirm('Remove ' + r.proto.toUpperCase() + ' :' + r.src_port + ' \u2192 ' + r.dest_ip + ':' + r.dest_port + '?')) return;
@@ -807,7 +1499,6 @@ async function removeRule(i) {
   else toast(data.error || 'error', false);
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────
 function toast(msg, ok) {
   var t = document.getElementById('toast');
   t.textContent = msg;
