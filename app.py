@@ -577,6 +577,9 @@ def cf_create_dns():
     port        = int(data.get("port", 0))
     add_udp     = data.get("add_udp", False)
     geyser_port = data.get("geyser_port", 0)
+    dest_ip     = data.get("dest_ip", "").strip()
+    dest_port   = int(data.get("dest_port", 0) or 0)
+    create_rule = data.get("create_portman_rule", False)
 
     if not all([subdomain, full_domain, linode_ip, srv_target, port]):
         return jsonify({"ok": False, "error": "missing required fields"})
@@ -596,6 +599,27 @@ def cf_create_dns():
         if geyser_port:
             r = cf_create_srv_record(subdomain, srv_target, geyser_port, "udp")
             results.append(f"Geyser SRV UDP ({geyser_port}): {r['msg']}")
+
+        # Optionally create portman DNAT rules
+        if create_rule and dest_ip and dest_port:
+            _dest_port = dest_port
+            add_rule("tcp", port, dest_ip, _dest_port)
+            lbl = load_labels()
+            lbl[label_key("tcp", port)] = {"label": label or subdomain, "domain": full_domain}
+            save_labels(lbl)
+            results.append(f"Portman TCP rule: :{port} → {dest_ip}:{_dest_port}")
+            if add_udp:
+                add_rule("udp", port, dest_ip, _dest_port)
+                lbl = load_labels()
+                lbl[label_key("udp", port)] = {"label": label or subdomain, "domain": full_domain}
+                save_labels(lbl)
+                results.append(f"Portman UDP rule: :{port} → {dest_ip}:{_dest_port}")
+            if geyser_port:
+                add_rule("udp", geyser_port, dest_ip, geyser_port)
+                lbl = load_labels()
+                lbl[label_key("udp", geyser_port)] = {"label": f"{label or subdomain} (geyser)", "domain": ""}
+                save_labels(lbl)
+                results.append(f"Portman Geyser UDP rule: :{geyser_port} → {dest_ip}:{geyser_port}")
 
         # Save entry to cf_auth so it shows in the records list
         d = load_cf_auth()
@@ -989,6 +1013,22 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
     <label>Geyser port</label>
     <input type="number" id="geyser-port" placeholder="19132" min="1" max="65535">
   </div>
+  <div class="check">
+    <input type="checkbox" id="create-portman-rule" onchange="togglePortmanRule()">
+    <label style="margin:0;text-transform:none;letter-spacing:0;font-size:0.8rem;color:var(--text)">Also create portman forwarding rule</label>
+  </div>
+  <div id="portman-rule-wrap" style="display:none;margin-top:0.75rem;padding:0.75rem;border:1px solid rgba(0,229,255,0.15);border-radius:4px;background:rgba(0,229,255,0.03)">
+    <div class="row" style="margin-top:0">
+      <div>
+        <label>Destination IP <span style="font-size:0.6rem;opacity:0.6">(WireGuard peer, e.g. 10.10.0.2)</span></label>
+        <input type="text" id="portman-dest-ip" placeholder="10.10.0.2">
+      </div>
+      <div>
+        <label>Destination port</label>
+        <input type="number" id="portman-dest-port" placeholder="same as java port" min="1" max="65535">
+      </div>
+    </div>
+  </div>
   <button class="btn" id="dns-btn" onclick="createDNS()">CREATE RECORDS</button>
   <div class="results" id="results"></div>
 </div>
@@ -1066,6 +1106,11 @@ function toggleGeyser() {
     document.getElementById('add-geyser').checked ? 'block' : 'none';
 }
 
+function togglePortmanRule() {
+  document.getElementById('portman-rule-wrap').style.display =
+    document.getElementById('create-portman-rule').checked ? 'block' : 'none';
+}
+
 async function loadEntries() {
   var res  = await fetch('/api/cf/dns');
   var data = await res.json();
@@ -1122,8 +1167,12 @@ async function createDNS() {
   var addGeyser   = document.getElementById('add-geyser').checked;
   var geyserPort  = addGeyser ? parseInt(document.getElementById('geyser-port').value) : 0;
   var zoneName    = document.getElementById('zone-name').value.trim();
+  var createRule  = document.getElementById('create-portman-rule').checked;
+  var destIp      = createRule ? document.getElementById('portman-dest-ip').value.trim() : '';
+  var destPort    = createRule ? parseInt(document.getElementById('portman-dest-port').value || javaPort) : 0;
 
   if (!subdomain || !linodeIp || !srvTarget || !javaPort) { toast('fill in all required fields', false); return; }
+  if (createRule && !destIp) { toast('enter destination IP for portman rule', false); return; }
 
   var fullDomain = subdomain + (zoneName ? '.' + zoneName : '');
   var btn = document.getElementById('dns-btn');
@@ -1135,7 +1184,8 @@ async function createDNS() {
     body: JSON.stringify({
       label: label, subdomain: subdomain, full_domain: fullDomain,
       linode_ip: linodeIp, srv_target: srvTarget,
-      port: javaPort, add_udp: addUdp, geyser_port: geyserPort
+      port: javaPort, add_udp: addUdp, geyser_port: geyserPort,
+      create_portman_rule: createRule, dest_ip: destIp, dest_port: destPort || javaPort
     })
   });
   var data = await res.json();
