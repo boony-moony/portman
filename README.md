@@ -1,50 +1,28 @@
 # portman
 
-A lightweight web UI for managing iptables DNAT port forwarding rules on a Linux VPS. Built for the common homelab setup where a VPS acts as a public gateway, forwarding traffic through a WireGuard tunnel to a home server.
-
-## Use case
-
-If you run game servers or other UDP/TCP services at home but don't have a static public IP, a common solution is:
+Lightweight web UI for managing iptables DNAT port forwarding on a Linux VPS. Built for the homelab setup where a VPS acts as a public entry point, forwarding traffic through WireGuard to a home server.
 
 ```
-Internet → VPS (public IP) → WireGuard tunnel → Home server (TrueNAS, etc.)
+Internet → VPS (public IP) → WireGuard → Home server (TrueNAS, etc.)
 ```
-
-Managing iptables rules for this manually is tedious. Portman gives you a simple web UI to add and remove forwarding rules without touching the command line.
-
-## What it does
-
-For every rule you add, portman automatically creates:
-- `iptables PREROUTING DNAT` — redirects incoming traffic to the tunnel
-- `iptables FORWARD ACCEPT` — allows traffic through
-- `iptables POSTROUTING MASQUERADE` — ensures replies route back correctly
-
-Rules are persisted via `iptables-save` and survive reboots. Existing rules are loaded from iptables on startup so nothing gets duplicated.
 
 ## Requirements
 
-- Debian/Ubuntu based VPS (tested on Linode)
-- Python 3
-- Root access (iptables requires it)
+- Debian/Ubuntu VPS with root access
 - WireGuard already configured between VPS and home server
+- Python 3
 
 ## Installation
 
-Copy the three files to your VPS and run the installer as root:
-
 ```bash
-scp -r portman/ root@<your-vps-ip>:/root/portman
-ssh root@<your-vps-ip>
+scp -r portman/ root@<vps-ip>:/root/portman
+ssh root@<vps-ip>
 cd /root/portman
 chmod +x install.sh
 ./install.sh
 ```
 
-The installer will:
-- Install Python dependencies (`flask`, `flask-httpauth`, `werkzeug`)
-- Install `iptables-persistent` for rule persistence
-- Copy `app.py` to `/opt/portman/`
-- Install and enable the systemd service
+The installer prompts for fresh install, update, or remove, and optionally enables Cloudflare integration.
 
 ## Configuration
 
@@ -58,38 +36,43 @@ nano /etc/systemd/system/portman.service
 |---|---|
 | `PORTMAN_USER` | Web UI username |
 | `PORTMAN_PASS` | Web UI password |
-| `DEST_IP` | Default destination IP (your home server's WireGuard IP, e.g. `10.10.0.2`) |
-| `WAN_IFACE` | Your VPS internet interface (find with `ip route \| grep default`) |
+| `DEST_IP` | Default WireGuard peer IP (e.g. `10.10.0.2`) |
+| `WAN_IFACE` | VPS internet interface (find with `ip route \| grep default`) |
 | `SECRET_KEY` | Any random string for Flask sessions |
-
-Then start it:
 
 ```bash
 systemctl daemon-reload
 systemctl start portman
-systemctl status portman
 ```
 
 ## Usage
 
-Access the UI at `http://<your-vps-ip>:5000`. Log in with your configured credentials.
+Access at `http://<vps-ip>:5000`. For HTTPS, run certbot after pointing a subdomain at the VPS:
 
-To forward a game server port (e.g. Minecraft on 25565):
-1. Select protocol (TCP or UDP — add both if needed)
-2. Enter the incoming port on the VPS (e.g. `25565`)
-3. Enter the destination IP (your home server's WireGuard IP, e.g. `10.10.0.2`)
-4. Enter the destination port (e.g. `25565`)
-5. Click **ADD RULE**
+```bash
+certbot --nginx -d portman.yourdomain.com
+```
 
-To remove a rule, click **remove** next to it in the table.
+Each rule you add creates three iptables entries automatically:
+- `PREROUTING DNAT` — redirects incoming traffic into the tunnel
+- `FORWARD ACCEPT` — allows traffic through
+- `POSTROUTING MASQUERADE` — routes replies back correctly
+
+Rules persist across reboots via `iptables-save`.
+
+## Cloudflare integration
+
+Enable during install or update. First visit to `/cloudflare` requires setting up a password and TOTP — keep the secret safe, losing it requires manually deleting `/opt/portman/cf_auth.json`.
+
+From the Cloudflare page you can:
+- Create A and SRV records for game servers (including Geyser/Bedrock)
+- Optionally create the matching portman DNAT rule at the same time
+- View and filter all DNS records in the zone
+- Delete CF records, portman rules, or both per saved entry
 
 ## Security
 
-Port 5000 should ideally not be publicly exposed. Restrict it via your VPS firewall (e.g. Linode Cloud Firewall) and access it over Tailscale or WireGuard only.
-
-## Notes
-
-- The `DEST_IP` env var pre-fills the destination IP field in the UI as a convenience
-- Protocol numbers in iptables output (`6` = TCP, `17` = UDP) are handled automatically
-- The service runs as root since iptables requires elevated privileges
-# portman
+- Port 5000 should not be publicly exposed — use HTTPS via nginx/certbot or restrict via firewall
+- Cloudflare page is behind a separate password + TOTP session (1 hour expiry)
+- API token and TOTP secret are stored in `/opt/portman/cf_auth.json` (chmod 600)
+- Service runs as root (required for iptables)

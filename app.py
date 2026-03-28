@@ -17,6 +17,7 @@ import hashlib
 import base64
 import urllib.request
 import urllib.error
+import uuid
 from flask import Flask, request, jsonify, session, redirect, url_for, make_response
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -30,6 +31,13 @@ USERNAME      = os.environ.get("PORTMAN_USER", "admin")
 PASSWORD_HASH = generate_password_hash(os.environ.get("PORTMAN_PASS", "admin"))
 DEFAULT_DEST_IP = os.environ.get("DEST_IP", "")
 WAN_IFACE     = os.environ.get("WAN_IFACE", "eth0")
+DEMO_MODE     = os.environ.get("DEMO_MODE", "").lower() in ("1", "true", "yes")
+
+def demo_block():
+    """Return a 403 response if running in demo mode."""
+    if DEMO_MODE:
+        return jsonify({"ok": False, "error": "demo mode — read only"}), 403
+    return None
 
 LABELS_FILE   = "/opt/portman/labels.json"
 SETTINGS_FILE = "/opt/portman/settings.json"
@@ -318,7 +326,7 @@ def persist():
 def index():
     settings = load_settings()
     cf_enabled = settings.get("cloudflare_enabled", False)
-    return HTML_PAGE.replace("__CF_ENABLED__", "true" if cf_enabled else "false")
+    return HTML_PAGE         .replace("__CF_ENABLED__", "true" if cf_enabled else "false")         .replace("__DEMO_MODE__", "true" if DEMO_MODE else "false")
 
 @app.route("/api/rules", methods=["GET"])
 @auth.login_required
@@ -328,6 +336,8 @@ def api_rules():
 @app.route("/api/rules", methods=["POST"])
 @auth.login_required
 def api_add():
+    blocked = demo_block()
+    if blocked: return blocked
     data = request.json
     try:
         proto     = data["proto"].lower()
@@ -352,6 +362,8 @@ def api_add():
 @app.route("/api/rules", methods=["PUT"])
 @auth.login_required
 def api_edit():
+    blocked = demo_block()
+    if blocked: return blocked
     data = request.json
     try:
         old_proto     = data["old_proto"].lower()
@@ -394,6 +406,8 @@ def api_edit():
 @app.route("/api/rules", methods=["DELETE"])
 @auth.login_required
 def api_remove():
+    blocked = demo_block()
+    if blocked: return blocked
     data = request.json
     try:
         proto     = data["proto"].lower()
@@ -421,6 +435,8 @@ def api_get_settings():
 @app.route("/api/settings", methods=["POST"])
 @auth.login_required
 def api_save_settings():
+    blocked = demo_block()
+    if blocked: return blocked
     data     = request.json
     settings = load_settings()
     if "certbot_email" in data:
@@ -431,6 +447,8 @@ def api_save_settings():
 @app.route("/api/ssl", methods=["POST"])
 @auth.login_required
 def api_ssl():
+    blocked = demo_block()
+    if blocked: return blocked
     data   = request.json
     domain = data.get("domain", "").strip()
     if not domain or not _valid_domain(domain):
@@ -472,11 +490,13 @@ def cf_page():
     return CF_MAIN_PAGE \
         .replace("__TOKEN_SET__",   "true" if token_set else "false") \
         .replace("__ZONE_ID_SET__", "true" if zone_id_set else "false") \
-        .replace("__ZONE_NAME__",   zone_name)
+        .replace("__DEMO_MODE__",   "true" if DEMO_MODE else "false")
 
 @app.route("/api/cf/setup", methods=["POST"])
 @auth.login_required
 def cf_setup():
+    blocked = demo_block()
+    if blocked: return blocked
     settings = load_settings()
     if not settings.get("cloudflare_enabled", False):
         return jsonify({"ok": False, "error": "not enabled"}), 403
@@ -546,6 +566,8 @@ def cf_get_config():
 @app.route("/api/cf/config", methods=["POST"])
 @auth.login_required
 def cf_save_config():
+    blocked = demo_block()
+    if blocked: return blocked
     if not cf_session_valid():
         return jsonify({"ok": False, "error": "not authenticated"}), 401
     data      = request.json
@@ -566,6 +588,8 @@ def cf_save_config():
 @auth.login_required
 def cf_create_dns():
     """Create A record + TCP SRV (and optionally UDP SRV) for a rule."""
+    blocked = demo_block()
+    if blocked: return blocked
     if not cf_session_valid():
         return jsonify({"ok": False, "error": "not authenticated"}), 401
     data        = request.json
@@ -587,7 +611,12 @@ def cf_create_dns():
     results = []
     try:
         r = cf_create_a_record(full_domain, linode_ip)
-        results.append(f"A record: {r['msg']}")
+        results.append(f"A record ({full_domain}): {r['msg']}")
+
+        # Also create A record for SRV target if it doesn't already exist
+        if srv_target and srv_target != full_domain:
+            r = cf_create_a_record(srv_target, linode_ip)
+            results.append(f"A record ({srv_target}): {r['msg']}")
 
         r = cf_create_srv_record(subdomain, srv_target, port, "tcp")
         results.append(f"SRV TCP: {r['msg']}")
@@ -624,18 +653,49 @@ def cf_create_dns():
         # Save entry to cf_auth so it shows in the records list
         d = load_cf_auth()
         entries = d.get("dns_entries", [])
+
+        # Collect CF record IDs created in this run for easy bulk delete later
+        cf_record_ids = []
+        # Re-fetch zone records to find the IDs we just created
+        try:
+            zone_result = cf_api("GET", "/dns_records?per_page=100")
+            for rec in zone_result.get("result", []):
+                rname = rec.get("name", "")
+                if rname == full_domain and rec.get("type") == "A":
+                    cf_record_ids.append(rec["id"])
+                elif f"_{subdomain}" in rname or (f".{subdomain}." in rname) or rname.endswith(f".{subdomain}"):
+                    if rec.get("type") == "SRV":
+                        cf_record_ids.append(rec["id"])
+        except Exception:
+            pass
+
+        # Collect portman rule keys created
+        portman_keys = []
+        if create_rule and dest_ip and dest_port:
+            portman_keys.append(label_key("tcp", port))
+            if add_udp:
+                portman_keys.append(label_key("udp", port))
+            if geyser_port:
+                portman_keys.append(label_key("udp", geyser_port))
+
+        entry_id = str(uuid.uuid4())[:8]
         entries.append({
-            "label":       label or subdomain,
-            "subdomain":   subdomain,
-            "full_domain": full_domain,
-            "port":        port,
-            "geyser_port": geyser_port or None,
-            "add_udp":     add_udp,
+            "id":            entry_id,
+            "label":         label or subdomain,
+            "subdomain":     subdomain,
+            "full_domain":   full_domain,
+            "port":          port,
+            "geyser_port":   geyser_port or None,
+            "add_udp":       add_udp,
+            "dest_ip":       dest_ip if create_rule else "",
+            "dest_port":     dest_port if create_rule else None,
+            "cf_record_ids": cf_record_ids,
+            "portman_keys":  portman_keys,
         })
         d["dns_entries"] = entries
         save_cf_auth(d)
 
-        return jsonify({"ok": True, "results": results})
+        return jsonify({"ok": True, "results": results, "entry_id": entry_id})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "partial": results})
 
@@ -650,15 +710,54 @@ def cf_list_dns():
 @app.route("/api/cf/dns/<int:index>", methods=["DELETE"])
 @auth.login_required
 def cf_delete_dns(index):
+    blocked = demo_block()
+    if blocked: return blocked
     if not cf_session_valid():
         return jsonify({"ok": False, "error": "not authenticated"}), 401
+    data       = request.json or {}
+    delete_cf  = data.get("delete_cf", False)
+    delete_rules = data.get("delete_rules", False)
     d = load_cf_auth()
     entries = d.get("dns_entries", [])
-    if 0 <= index < len(entries):
-        entries.pop(index)
-        d["dns_entries"] = entries
-        save_cf_auth(d)
-    return jsonify({"ok": True})
+    if not (0 <= index < len(entries)):
+        return jsonify({"ok": False, "error": "entry not found"}), 404
+
+    entry   = entries[index]
+    results = []
+    errors  = []
+
+    # Delete CF DNS records
+    if delete_cf:
+        for rec_id in entry.get("cf_record_ids", []):
+            try:
+                cf_api("DELETE", f"/dns_records/{rec_id}")
+                results.append(f"CF record {rec_id[:8]}... deleted")
+            except Exception as e:
+                errors.append(f"CF record {rec_id[:8]}...: {e}")
+
+    # Delete portman iptables rules
+    if delete_rules:
+        labels = load_labels()
+        for key in entry.get("portman_keys", []):
+            meta = labels.get(key, {})
+            try:
+                proto, src_port = key.split(":")
+                src_port = int(src_port)
+                dest_ip   = entry.get("dest_ip", "")
+                dest_port = entry.get("dest_port") or src_port
+                if dest_ip:
+                    remove_rule(proto, src_port, dest_ip, dest_port)
+                    results.append(f"Portman rule {key} removed")
+                if key in labels:
+                    del labels[key]
+            except Exception as e:
+                errors.append(f"Portman rule {key}: {e}")
+        save_labels(labels)
+
+    entries.pop(index)
+    d["dns_entries"] = entries
+    save_cf_auth(d)
+    return jsonify({"ok": True, "results": results, "errors": errors})
 
 
 @app.route("/api/cf/zone_records", methods=["GET"])
@@ -900,6 +999,9 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="cf-demo-banner" style="display:none;background:rgba(255,179,71,0.1);border:1px solid rgba(255,179,71,0.4);color:#ffb347;padding:0.6rem 1.25rem;border-radius:6px;font-size:0.75rem;margin-bottom:1rem;text-align:center;letter-spacing:0.5px">
+  ⚠ demo mode — read only view. all write operations are disabled.
+</div>
 <header>
   <h1>cloudflare</h1>
   <span class="sub">DNS record manager</span>
@@ -922,7 +1024,7 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
     </div>
     <div>
       <label>Zone name <span style="font-size:0.6rem;opacity:0.6">(e.g. linuslinus.com)</span></label>
-      <input type="text" id="zone-name" placeholder="yourdomain.com" value="__ZONE_NAME__">
+      <input type="text" id="zone-name" placeholder="yourdomain.com">
     </div>
   </div>
   <button class="btn" onclick="saveConfig()">SAVE CONFIG</button>
@@ -962,18 +1064,7 @@ CF_MAIN_PAGE = """<!DOCTYPE html>
 <!-- Saved DNS entries -->
 <div class="section" id="entries-section" style="display:none">
   <h2>saved server records</h2>
-  <table id="entries-table" style="width:100%;border-collapse:collapse;font-size:0.8rem">
-    <thead>
-      <tr>
-        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Label</th>
-        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Domain</th>
-        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Port</th>
-        <th style="text-align:left;padding:0.5rem 0.75rem;font-size:0.62rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);border-bottom:1px solid var(--border)">Geyser</th>
-        <th style="border-bottom:1px solid var(--border)"></th>
-      </tr>
-    </thead>
-    <tbody id="entries-body"></tbody>
-  </table>
+  <div id="entries-list"></div>
 </div>
 
 <!-- Create DNS records -->
@@ -1093,12 +1184,15 @@ function filterRecords() {
 
 const TOKEN_SET   = __TOKEN_SET__;
 const ZONE_ID_SET = __ZONE_ID_SET__;
+const DEMO_MODE   = __DEMO_MODE__;
 
 (function() {
   var dot = document.getElementById('cfg-dot');
   dot.className = 'status-dot ' + (TOKEN_SET && ZONE_ID_SET ? 'dot-ok' : 'dot-err');
   loadEntries();
   loadZoneRecords();
+  if (DEMO_MODE) document.getElementById('cf-demo-banner').style.display = 'block';
+  fetch('/api/cf/config').then(function(r){return r.json();}).then(function(d){ if(d.ok && d.zone_name) document.getElementById('zone-name').value = d.zone_name; });
 })();
 
 function toggleGeyser() {
@@ -1117,28 +1211,74 @@ async function loadEntries() {
   if (!data.ok) return;
   var entries = data.entries || [];
   var section = document.getElementById('entries-section');
-  var tbody   = document.getElementById('entries-body');
+  var list    = document.getElementById('entries-list');
   if (!entries.length) { section.style.display = 'none'; return; }
   section.style.display = 'block';
-  tbody.innerHTML = entries.map(function(e, i) {
-    return '<tr>' +
-      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--accent)">' + esc(e.label) + '</td>' +
-      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--muted)">' + esc(e.full_domain) + '</td>' +
-      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border)">' + e.port + '</td>' +
-      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);color:var(--muted)">' + (e.geyser_port || '—') + '</td>' +
-      '<td style="padding:0.6rem 0.75rem;border-bottom:1px solid var(--border);text-align:right">' +
-        '<button onclick="removeEntry(' + i + ')" style="background:none;border:1px solid var(--accent2);color:var(--accent2);border-radius:4px;padding:3px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">remove</button>' +
-      '</td>' +
-    '</tr>';
+  list.innerHTML = entries.map(function(e, i) {
+    var hasCF    = e.cf_record_ids && e.cf_record_ids.length > 0;
+    var hasRules = e.portman_keys  && e.portman_keys.length  > 0;
+    var tags = '';
+    if (hasCF)    tags += '<span style="background:rgba(246,130,31,0.12);border:1px solid rgba(246,130,31,0.4);color:#f6821f;padding:2px 7px;border-radius:3px;font-size:0.62rem;margin-right:0.35rem">CF records: ' + e.cf_record_ids.length + '</span>';
+    if (hasRules) tags += '<span style="background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.3);color:var(--accent);padding:2px 7px;border-radius:3px;font-size:0.62rem">portman rules: ' + e.portman_keys.length + '</span>';
+
+    var details =
+      '<div style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border);font-size:0.75rem;color:var(--muted);line-height:2">' +
+        '<div><span style="color:var(--text)">domain</span> &nbsp;' + esc(e.full_domain) + '</div>' +
+        '<div><span style="color:var(--text)">java port</span> &nbsp;' + e.port + (e.add_udp ? ' (TCP+UDP)' : ' (TCP)') + '</div>' +
+        (e.geyser_port ? '<div><span style="color:var(--text)">geyser port</span> &nbsp;' + e.geyser_port + '</div>' : '') +
+        (e.dest_ip ? '<div><span style="color:var(--text)">dest</span> &nbsp;' + esc(e.dest_ip) + ':' + (e.dest_port || e.port) + '</div>' : '') +
+        (hasCF ? '<div style="margin-top:0.5rem"><span style="color:var(--text)">CF record IDs</span><br>' + e.cf_record_ids.map(function(id){return '<span style="font-size:0.68rem;opacity:0.6">'+id+'</span>';}).join('<br>') + '</div>' : '') +
+        (hasRules ? '<div style="margin-top:0.5rem"><span style="color:var(--text)">portman keys</span> &nbsp;' + e.portman_keys.join(', ') + '</div>' : '') +
+      '</div>' +
+      '<div style="display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap">' +
+        (hasCF ? '<button onclick="removeEntry('+i+',true,false)" style="background:none;border:1px solid #f6821f;color:#f6821f;border-radius:4px;padding:4px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">delete CF records</button>' : '') +
+        (hasRules ? '<button onclick="removeEntry('+i+',false,true)" style="background:none;border:1px solid var(--accent);color:var(--accent);border-radius:4px;padding:4px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">delete portman rules</button>' : '') +
+        (hasCF && hasRules ? '<button onclick="removeEntry('+i+',true,true)" style="background:none;border:1px solid var(--accent2);color:var(--accent2);border-radius:4px;padding:4px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">delete everything</button>' : '') +
+        '<button onclick="removeEntry('+i+',false,false)" style="background:none;border:1px solid var(--border);color:var(--muted);border-radius:4px;padding:4px 10px;font-family:var(--mono);font-size:0.68rem;cursor:pointer">remove from list only</button>' +
+      '</div>';
+
+    return '<div style="border:1px solid var(--border);border-radius:6px;margin-bottom:0.75rem;overflow:hidden">' +
+      '<div onclick="toggleEntry(this)" style="display:flex;align-items:center;justify-content:space-between;padding:0.85rem 1rem;cursor:pointer;user-select:none" onmouseover="this.style.background=&quot;rgba(255,255,255,0.02)&quot;" onmouseout="this.style.background=&quot;&quot;">' +
+        '<div style="display:flex;align-items:center;gap:0.75rem">' +
+          '<span style="color:var(--accent);font-size:0.85rem;font-weight:600">' + esc(e.label) + '</span>' +
+          '<span style="color:var(--muted);font-size:0.7rem">#' + esc(e.id || i) + '</span>' +
+          tags +
+        '</div>' +
+        '<span class="entry-chevron" style="color:var(--muted);font-size:0.8rem;transition:transform 0.2s">▼</span>' +
+      '</div>' +
+      '<div class="entry-body" style="display:none;padding:0 1rem 1rem 1rem">' + details + '</div>' +
+    '</div>';
   }).join('');
 }
 
-async function removeEntry(i) {
-  if (!confirm('Remove this entry from the list? (DNS records on Cloudflare are NOT deleted)')) return;
-  var res  = await fetch('/api/cf/dns/' + i, {method:'DELETE'});
+function toggleEntry(header) {
+  var body    = header.nextElementSibling;
+  var chevron = header.querySelector('.entry-chevron');
+  var open    = body.style.display === 'none';
+  body.style.display    = open ? 'block' : 'none';
+  chevron.style.transform = open ? 'rotate(180deg)' : '';
+}
+
+async function removeEntry(i, deleteCF, deleteRules) {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
+  var msg = deleteCF && deleteRules ? 'Delete CF DNS records AND portman rules?' :
+            deleteCF   ? 'Delete CF DNS records? (portman rules kept)' :
+            deleteRules ? 'Delete portman rules? (CF records kept)' :
+            'Remove from list only? (nothing deleted from CF or portman)';
+  if (!confirm(msg)) return;
+  var res  = await fetch('/api/cf/dns/' + i, {
+    method: 'DELETE',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({delete_cf: !!deleteCF, delete_rules: !!deleteRules})
+  });
   var data = await res.json();
-  if (data.ok) loadEntries();
-  else toast(data.error || 'error', false);
+  if (data.ok) {
+    if (data.results && data.results.length) toast(data.results.length + ' item(s) deleted', true);
+    else toast('removed from list', true);
+    if (data.errors && data.errors.length) toast('errors: ' + data.errors.join(', '), false);
+    loadEntries();
+    if (deleteRules) loadZoneRecords();
+  } else toast(data.error || 'error', false);
 }
 
 function esc(s) {
@@ -1146,6 +1286,7 @@ function esc(s) {
 }
 
 async function saveConfig() {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var payload = {
     api_token: document.getElementById('api-token').value.trim(),
     zone_id:   document.getElementById('zone-id').value.trim(),
@@ -1158,6 +1299,7 @@ async function saveConfig() {
 }
 
 async function createDNS() {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var label       = document.getElementById('dns-label').value.trim();
   var subdomain   = document.getElementById('subdomain').value.trim();
   var linodeIp    = document.getElementById('linode-ip').value.trim();
@@ -1411,6 +1553,9 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 
+<div id="demo-banner" style="display:none;background:rgba(255,179,71,0.1);border:1px solid rgba(255,179,71,0.4);color:#ffb347;padding:0.6rem 1.25rem;border-radius:6px;font-size:0.75rem;margin-bottom:1rem;text-align:center;letter-spacing:0.5px">
+  ⚠ demo mode — read only view. all write operations are disabled.
+</div>
 <header>
   <h1>portman</h1>
   <span class="subtitle">iptables DNAT manager &mdash; """ + (DEFAULT_DEST_IP or "set DEST_IP env") + """</span>
@@ -1490,6 +1635,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <script>
 const DEFAULT_DEST_IP = '""" + DEFAULT_DEST_IP + """';
 const CF_ENABLED = __CF_ENABLED__;
+const DEMO_MODE  = __DEMO_MODE__;
 
 let rules    = [];
 let editMode = false;
@@ -1498,6 +1644,12 @@ let editIdx  = -1;
 async function init() {
   await Promise.all([loadRules(), loadSettings()]);
   if (CF_ENABLED) document.getElementById('cf-btn').style.display = 'inline-block';
+  if (DEMO_MODE) {
+    document.getElementById('demo-banner').style.display = 'block';
+    // Disable all write buttons
+    document.getElementById('add-btn').disabled = true;
+    document.getElementById('add-btn').title = 'demo mode — read only';
+  }
 }
 
 function toggleSettings() {
@@ -1515,6 +1667,7 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var email = document.getElementById('certbot-email').value.trim();
   var res   = await fetch('/api/settings', {
     method: 'POST',
@@ -1614,6 +1767,7 @@ function cancelEdit() {
 }
 
 async function submitRule() {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var proto     = document.getElementById('proto').value;
   var src_port  = parseInt(document.getElementById('src_port').value);
   var dest_ip   = document.getElementById('dest_ip').value.trim();
@@ -1677,6 +1831,7 @@ async function requestCert(domain) {
 }
 
 async function removeRule(i) {
+  if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var r = rules[i];
   if (!confirm('Remove ' + r.proto.toUpperCase() + ' :' + r.src_port + ' \u2192 ' + r.dest_ip + ':' + r.dest_port + '?')) return;
   var res = await fetch('/api/rules', {
