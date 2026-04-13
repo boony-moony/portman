@@ -312,12 +312,14 @@ def remove_rule(proto, src_port, dest_ip, dest_port):
 
 def persist():
     try:
-        run("iptables-save > /etc/iptables/rules.v4")
-    except Exception:
-        try:
-            run("iptables-save > /etc/iptables.rules")
-        except Exception:
-            pass
+        os.makedirs("/etc/iptables", exist_ok=True)
+        result = subprocess.run("iptables-save", shell=True, capture_output=True, text=True)
+        if result.returncode == 0:
+            with open("/etc/iptables/rules.v4", "w") as f:
+                f.write(result.stdout)
+        subprocess.run("netfilter-persistent save", shell=True, capture_output=True)
+    except Exception as e:
+        print(f"[portman] persist error: {e}")
 
 # ── Routes — main app ────────────────────────────────────────────────────────
 
