@@ -18,6 +18,8 @@ import base64
 import urllib.request
 import urllib.error
 import uuid
+import ipaddress
+import shlex
 from flask import Flask, request, jsonify, session, redirect, url_for, make_response
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -44,6 +46,7 @@ SETTINGS_FILE = "/opt/portman/settings.json"
 CF_AUTH_FILE  = "/opt/portman/cf_auth.json"
 NGINX_AVAIL   = "/etc/nginx/sites-available"
 NGINX_ENABLED = "/etc/nginx/sites-enabled"
+STEAM_SYSCTL_FILE = "/etc/sysctl.d/99-portman-steam.conf"
 
 @auth.verify_password
 def verify_password(username, password):
@@ -55,6 +58,12 @@ def run(cmd, check=True):
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
+
+def run_argv(argv, check=True):
+    result = subprocess.run(argv, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "command failed")
+    return result
 
 PROTO_MAP = {"6": "tcp", "17": "udp", "tcp": "tcp", "udp": "udp"}
 
@@ -83,7 +92,22 @@ def load_settings():
         with open(SETTINGS_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"certbot_email": "", "cloudflare_enabled": False}
+        return default_settings()
+
+def default_settings():
+    return {
+        "certbot_email": "",
+        "cloudflare_enabled": False,
+        "steam_enabled": False,
+        "steam_source_cidr": "",
+        "steam_wg_iface": "wg0",
+        "steam_route_table": 51820,
+    }
+
+def normalized_settings():
+    settings = default_settings()
+    settings.update(load_settings())
+    return settings
 
 def save_settings(settings):
     try:
@@ -92,6 +116,18 @@ def save_settings(settings):
             json.dump(settings, f, indent=2)
     except Exception as e:
         print(f"Error saving settings: {e}")
+
+def _valid_iface(value):
+    return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", value or ""))
+
+def _valid_ipv4_cidr(value):
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+        if network.version != 4:
+            raise ValueError
+        return str(network)
+    except ValueError:
+        raise ValueError("Steam source must be a valid IPv4 subnet, for example 172.20.0.0/24")
 
 # ── Cloudflare auth (TOTP + password, stored separately) ────────────────────
 
@@ -292,6 +328,7 @@ def get_existing_rules():
                     "dest_port":  int(m.group(5)),
                     "label":      meta.get("label", ""),
                     "domain":     dom,
+                    "steam":      bool(meta.get("steam", False)),
                     "ssl_active": ssl_active(dom),
                 })
     except Exception as e:
@@ -321,12 +358,94 @@ def persist():
     except Exception as e:
         print(f"[portman] persist error: {e}")
 
+# ── Steam outbound routing ──────────────────────────────────────────────────
+
+def _steam_rule_specs(settings):
+    """Rules that make selected home/container traffic leave through the VPS."""
+    cidr = _valid_ipv4_cidr(settings.get("steam_source_cidr", ""))
+    wg_iface = settings.get("steam_wg_iface", "")
+    if not _valid_iface(wg_iface) or not _valid_iface(WAN_IFACE):
+        raise ValueError("Invalid WireGuard or WAN interface name")
+    comment = "portman-steam"
+    return [
+        ("filter", ["FORWARD", "-i", wg_iface, "-o", WAN_IFACE, "-s", cidr,
+                    "-m", "comment", "--comment", comment, "-j", "ACCEPT"]),
+        ("filter", ["FORWARD", "-i", WAN_IFACE, "-o", wg_iface, "-d", cidr,
+                    "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                    "-m", "comment", "--comment", comment, "-j", "ACCEPT"]),
+        ("nat", ["POSTROUTING", "-s", cidr, "-o", WAN_IFACE,
+                 "-m", "comment", "--comment", comment, "-j", "MASQUERADE"]),
+    ]
+
+def _iptables_rule(table, action, spec, check=True):
+    return run_argv(["iptables", "-t", table, action] + spec, check=check)
+
+def apply_steam_routing(settings):
+    specs = _steam_rule_specs(settings)
+    with open(STEAM_SYSCTL_FILE, "w") as f:
+        f.write("# Managed by portman\nnet.ipv4.ip_forward=1\n")
+    run_argv(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    for table, spec in specs:
+        if _iptables_rule(table, "-C", spec, check=False).returncode != 0:
+            _iptables_rule(table, "-A", spec)
+    persist()
+
+def remove_steam_routing(settings):
+    try:
+        specs = _steam_rule_specs(settings)
+    except ValueError:
+        specs = []
+    for table, spec in specs:
+        while _iptables_rule(table, "-C", spec, check=False).returncode == 0:
+            _iptables_rule(table, "-D", spec, check=False)
+    try:
+        os.remove(STEAM_SYSCTL_FILE)
+    except FileNotFoundError:
+        pass
+    persist()
+
+def home_steam_script(settings):
+    cidr = _valid_ipv4_cidr(settings.get("steam_source_cidr", ""))
+    iface = settings.get("steam_wg_iface", "")
+    if not _valid_iface(iface):
+        raise ValueError("Invalid WireGuard interface name")
+    table = int(settings.get("steam_route_table", 51820))
+    if not 1 <= table <= 2_147_483_647:
+        raise ValueError("Routing table must be a positive integer")
+    qcidr, qiface = shlex.quote(cidr), shlex.quote(iface)
+    return f'''#!/bin/sh
+# Generated by portman. Run on the HOME game/Docker host as root.
+# The VPS WireGuard peer must allow 0.0.0.0/0 on this host. Use Table = off
+# in wg-quick so only this source subnet follows the tunnel.
+set -eu
+SOURCE_CIDR={qcidr}
+WG_IFACE={qiface}
+ROUTE_TABLE={table}
+
+ip link show "$WG_IFACE" >/dev/null
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null
+sysctl -w "net.ipv4.conf.$WG_IFACE.rp_filter=2" >/dev/null
+ip route replace default dev "$WG_IFACE" table "$ROUTE_TABLE"
+ip rule del from "$SOURCE_CIDR" table "$ROUTE_TABLE" priority 100 2>/dev/null || true
+ip rule add from "$SOURCE_CIDR" table "$ROUTE_TABLE" priority 100
+# Keep Docker/CNI from hiding the container source before WireGuard. The VPS
+# peer AllowedIPs provides WireGuard's source-address authorization.
+iptables -t nat -C POSTROUTING -s "$SOURCE_CIDR" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || \
+  iptables -t nat -I POSTROUTING 1 -s "$SOURCE_CIDR" -o "$WG_IFACE" -j ACCEPT
+iptables -C FORWARD -s "$SOURCE_CIDR" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -s "$SOURCE_CIDR" -o "$WG_IFACE" -j ACCEPT
+iptables -C FORWARD -d "$SOURCE_CIDR" -i "$WG_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -d "$SOURCE_CIDR" -i "$WG_IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+echo "Portman Steam routing active for $SOURCE_CIDR via $WG_IFACE (table $ROUTE_TABLE)"
+'''
+
 # ── Routes — main app ────────────────────────────────────────────────────────
 
 @app.route("/")
 @auth.login_required
 def index():
-    settings = load_settings()
+    settings = normalized_settings()
     cf_enabled = settings.get("cloudflare_enabled", False)
     return HTML_PAGE         .replace("__CF_ENABLED__", "true" if cf_enabled else "false")         .replace("__DEMO_MODE__", "true" if DEMO_MODE else "false")
 
@@ -348,12 +467,13 @@ def api_add():
         dest_port = int(data["dest_port"])
         label     = data.get("label", "").strip()
         domain    = data.get("domain", "").strip()
+        steam     = bool(data.get("steam", False))
         assert proto in ("tcp", "udp")
         assert 1 <= src_port <= 65535
         assert 1 <= dest_port <= 65535
         add_rule(proto, src_port, dest_ip, dest_port)
         labels = load_labels()
-        labels[label_key(proto, src_port)] = {"label": label, "domain": domain}
+        labels[label_key(proto, src_port)] = {"label": label, "domain": domain, "steam": steam}
         save_labels(labels)
         if domain:
             write_nginx_config(domain, dest_ip, dest_port)
@@ -378,6 +498,7 @@ def api_edit():
         new_dest_port = int(data["new_dest_port"])
         label         = data.get("label", "").strip()
         new_domain    = data.get("domain", "").strip()
+        steam         = bool(data.get("steam", False))
         assert new_proto in ("tcp", "udp")
         assert 1 <= new_src_port <= 65535
         assert 1 <= new_dest_port <= 65535
@@ -391,7 +512,7 @@ def api_edit():
 
         if old_key in labels:
             del labels[old_key]
-        labels[label_key(new_proto, new_src_port)] = {"label": label, "domain": new_domain}
+        labels[label_key(new_proto, new_src_port)] = {"label": label, "domain": new_domain, "steam": steam}
         save_labels(labels)
 
         if old_domain and old_domain != new_domain:
@@ -432,19 +553,62 @@ def api_remove():
 @app.route("/api/settings", methods=["GET"])
 @auth.login_required
 def api_get_settings():
-    return jsonify(load_settings())
+    return jsonify(normalized_settings())
 
 @app.route("/api/settings", methods=["POST"])
 @auth.login_required
 def api_save_settings():
     blocked = demo_block()
     if blocked: return blocked
-    data     = request.json
-    settings = load_settings()
-    if "certbot_email" in data:
-        settings["certbot_email"] = data["certbot_email"].strip()
-    save_settings(settings)
-    return jsonify({"ok": True})
+    data = request.json or {}
+    old_settings = normalized_settings()
+    settings = dict(old_settings)
+    try:
+        if "certbot_email" in data:
+            settings["certbot_email"] = data["certbot_email"].strip()
+        if "steam_enabled" in data:
+            settings["steam_enabled"] = bool(data["steam_enabled"])
+        if "steam_source_cidr" in data:
+            value = data["steam_source_cidr"].strip()
+            settings["steam_source_cidr"] = _valid_ipv4_cidr(value) if value else ""
+        if "steam_wg_iface" in data:
+            value = data["steam_wg_iface"].strip()
+            if not _valid_iface(value):
+                raise ValueError("Invalid WireGuard interface name")
+            settings["steam_wg_iface"] = value
+        if "steam_route_table" in data:
+            table = int(data["steam_route_table"])
+            if not 1 <= table <= 2_147_483_647:
+                raise ValueError("Routing table must be a positive integer")
+            settings["steam_route_table"] = table
+        if settings["steam_enabled"] and not settings["steam_source_cidr"]:
+            raise ValueError("Set the home game/container source subnet before enabling Steam routing")
+
+        if old_settings.get("steam_enabled"):
+            remove_steam_routing(old_settings)
+        if settings["steam_enabled"]:
+            apply_steam_routing(settings)
+        save_settings(settings)
+        return jsonify({"ok": True})
+    except Exception as e:
+        # Best-effort restoration if replacing an existing working setup failed.
+        if old_settings.get("steam_enabled"):
+            try:
+                apply_steam_routing(old_settings)
+            except Exception:
+                pass
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.route("/api/steam/home-script", methods=["GET"])
+@auth.login_required
+def api_steam_home_script():
+    try:
+        response = make_response(home_steam_script(normalized_settings()))
+        response.headers["Content-Type"] = "text/x-shellscript; charset=utf-8"
+        response.headers["Content-Disposition"] = "attachment; filename=portman-steam-home.sh"
+        return response
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 @app.route("/api/ssl", methods=["POST"])
 @auth.login_required
@@ -1426,6 +1590,10 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 1rem;
     flex-wrap: wrap;
   }
+  .settings-group { display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; width:100%; }
+  .settings-group + .settings-group { border-top:1px solid var(--border); padding-top:1rem; }
+  .settings-group input[type=checkbox] { width:auto; min-width:0; accent-color:var(--accent); }
+  .settings-help { width:100%; color:var(--muted); font-size:0.68rem; line-height:1.5; }
   .settings-bar .s-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; white-space: nowrap; }
   .settings-bar input { flex: 1; min-width: 200px; max-width: 320px; }
   .btn-save {
@@ -1568,9 +1736,20 @@ HTML_PAGE = """<!DOCTYPE html>
 </header>
 
 <div class="settings-bar" id="settings-bar" style="display:none">
-  <span class="s-label">Certbot email</span>
-  <input type="email" id="certbot-email" placeholder="admin@example.com">
-  <button class="btn-save" onclick="saveSettings()">Save</button>
+  <div class="settings-group">
+    <span class="s-label">Certbot email</span>
+    <input type="email" id="certbot-email" placeholder="admin@example.com">
+  </div>
+  <div class="settings-group">
+    <input type="checkbox" id="steam-enabled">
+    <span class="s-label">Steam outbound via VPS</span>
+    <input type="text" id="steam-source-cidr" placeholder="game subnet, e.g. 172.20.0.0/24">
+    <input type="text" id="steam-wg-iface" placeholder="WireGuard interface, e.g. wg0">
+    <input type="number" id="steam-route-table" placeholder="route table" min="1">
+    <a class="btn-save" href="/api/steam/home-script">Download home setup</a>
+    <div class="settings-help">Routes only this home/container subnet through WireGuard and NATs it on the VPS, so Steam sees the VPS public IP. The downloaded script configures the matching policy route on the home host.</div>
+  </div>
+  <button class="btn-save" onclick="saveSettings()">Save settings</button>
 </div>
 
 <div class="grid">
@@ -1627,6 +1806,13 @@ HTML_PAGE = """<!DOCTYPE html>
     <label>Destination port</label>
     <input type="number" id="dest_port" placeholder="e.g. 27015" min="1" max="65535">
 
+    <div class="ssl-option">
+      <label>
+        <input type="checkbox" id="steam-rule">
+        Steam game server
+      </label>
+    </div>
+
     <button class="btn-add" id="add-btn" onclick="submitRule()">ADD RULE</button>
     <a href="#" class="cancel-link" id="cancel-edit" onclick="cancelEdit(); return false;" style="display:none">cancel edit</a>
   </div>
@@ -1666,15 +1852,26 @@ async function loadSettings() {
   var res = await fetch('/api/settings');
   var s   = await res.json();
   document.getElementById('certbot-email').value = s.certbot_email || '';
+  document.getElementById('steam-enabled').checked = !!s.steam_enabled;
+  document.getElementById('steam-source-cidr').value = s.steam_source_cidr || '';
+  document.getElementById('steam-wg-iface').value = s.steam_wg_iface || 'wg0';
+  document.getElementById('steam-route-table').value = s.steam_route_table || 51820;
 }
 
 async function saveSettings() {
   if (DEMO_MODE) { toast('demo mode — read only', false); return; }
   var email = document.getElementById('certbot-email').value.trim();
+  var payload = {
+    certbot_email: email,
+    steam_enabled: document.getElementById('steam-enabled').checked,
+    steam_source_cidr: document.getElementById('steam-source-cidr').value.trim(),
+    steam_wg_iface: document.getElementById('steam-wg-iface').value.trim(),
+    steam_route_table: parseInt(document.getElementById('steam-route-table').value) || 51820
+  };
   var res   = await fetch('/api/settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({certbot_email: email})
+    body: JSON.stringify(payload)
   });
   var data = await res.json();
   toast(data.ok ? 'settings saved' : (data.error || 'error'), data.ok);
@@ -1691,8 +1888,9 @@ function escHtml(s) {
 }
 
 function labelCell(r) {
+  var steam = r.steam ? ' <span class="badge badge-udp" title="Steam outbound routing">STEAM</span>' : '';
   return r.label
-    ? '<span class="label-text">' + escHtml(r.label) + '</span>'
+    ? '<span class="label-text">' + escHtml(r.label) + steam + '</span>'
     : '<span class="muted-dash">&mdash;</span>';
 }
 
@@ -1740,6 +1938,7 @@ function startEdit(i) {
   document.getElementById('src_port').value = r.src_port;
   document.getElementById('dest_ip').value  = r.dest_ip;
   document.getElementById('dest_port').value = r.dest_port;
+  document.getElementById('steam-rule').checked = !!r.steam;
   document.getElementById('ssl-enabled').checked = false;
   document.getElementById('ssl-option').style.display = r.domain ? 'block' : 'none';
   var title = document.getElementById('form-title');
@@ -1766,6 +1965,7 @@ function cancelEdit() {
   document.getElementById('dest_port').value = '';
   document.getElementById('label').value    = '';
   document.getElementById('domain').value   = '';
+  document.getElementById('steam-rule').checked = false;
 }
 
 async function submitRule() {
@@ -1777,6 +1977,7 @@ async function submitRule() {
   var label     = document.getElementById('label').value.trim();
   var domain    = document.getElementById('domain').value.trim();
   var wantSsl   = document.getElementById('ssl-enabled').checked;
+  var steam     = document.getElementById('steam-rule').checked;
 
   if (!src_port || !dest_ip || !dest_port) { toast('fill in required fields', false); return; }
 
@@ -1795,14 +1996,14 @@ async function submitRule() {
         old_dest_ip: old.dest_ip, old_dest_port: old.dest_port,
         new_proto: proto, new_src_port: src_port,
         new_dest_ip: dest_ip, new_dest_port: dest_port,
-        label: label, domain: domain
+        label: label, domain: domain, steam: steam
       })
     });
   } else {
     res = await fetch('/api/rules', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({proto: proto, src_port: src_port, dest_ip: dest_ip, dest_port: dest_port, label: label, domain: domain})
+      body: JSON.stringify({proto: proto, src_port: src_port, dest_ip: dest_ip, dest_port: dest_port, label: label, domain: domain, steam: steam})
     });
   }
 

@@ -86,8 +86,11 @@ fi
 if [ "$ACTION" = "install" ]; then
     echo "[portman] Installing dependencies..."
     apt-get update -qq
-    apt-get install -y python3 python3-pip iptables-persistent nginx certbot python3-certbot-nginx
+    apt-get install -y python3 python3-pip iproute2 wireguard-tools iptables-persistent nginx certbot python3-certbot-nginx
 fi
+
+# Required by Steam source-policy routing; install on updates too.
+apt-get install -y iproute2 wireguard-tools
 
 echo "[portman] Updating Python packages..."
 pip3 install flask flask-httpauth werkzeug --break-system-packages

@@ -60,6 +60,42 @@ Each rule you add creates three iptables entries automatically:
 
 Rules persist across reboots via `iptables-save`.
 
+## Steam game servers behind CGNAT
+
+Portman can route a dedicated home or Docker subnet out through the VPS. This
+causes Steam's server directory and other external services to see the VPS
+public IP instead of the home's CGNAT address.
+
+1. Open **settings** and enable **Steam outbound via VPS**.
+2. Enter the source subnet used only by the game server(s), such as
+   `172.20.0.0/24`, and the existing WireGuard interface name.
+3. Save settings. Portman enables narrow forwarding and masquerade rules on
+   the VPS.
+4. Download **home setup**, copy it to the home Docker/game host, inspect it,
+   and run it as root after WireGuard is up.
+5. Mark the relevant forwarding rules as **Steam game server**. This is a UI
+   label; outbound selection is enforced by the source subnet.
+
+The WireGuard peer configuration must also permit that routed subnet:
+
+- On the home host, the VPS peer needs `AllowedIPs = 0.0.0.0/0` and
+  `Table = off`. `Table = off` prevents the whole home host from using the VPS;
+  the downloaded script adds a policy route only for the selected source.
+- On the VPS, the home peer's `AllowedIPs` must include both the home tunnel
+  address and the game source subnet (for example `10.10.0.2/32,
+  172.20.0.0/24`).
+
+Use a dedicated container VLAN/subnet where possible. Selecting the whole home
+LAN will route every device in that subnet through the VPS. The current Steam
+mode fixes outbound public-IP consistency; ordinary Portman DNAT still
+masquerades inbound connections, so game servers do not receive original
+player IPs.
+
+The downloaded home rules need to run again after a reboot or WireGuard
+restart. The simplest persistent setup is to call the saved script from the
+WireGuard interface's `PostUp` hook or from a systemd oneshot unit ordered
+after `wg-quick@<interface>` and Docker.
+
 ## Cloudflare integration
 
 Enable during install or update. First visit to `/cloudflare` requires setting up a password and TOTP — keep the secret safe, losing it requires manually deleting `/opt/portman/cf_auth.json`.
